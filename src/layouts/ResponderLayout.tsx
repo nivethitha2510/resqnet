@@ -2,15 +2,27 @@
  * Responder Tactical Field Layout
  */
 
-import React from 'react';
-import { useApp } from '../context/AppContext';
+import React, { useEffect, useState } from 'react';
+import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import { Truck, LogOut, UserCheck } from 'lucide-react';
 
 export const ResponderLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { vehicles } = useApp();
   const { user, profile, signOut } = useAuth();
-  const assignedUnit = vehicles.find((v) => v.id === 'VEH-FIRE-01') || vehicles[0];
+  const [assignedUnit, setAssignedUnit] = useState<any | null>(null);
+
+  useEffect(() => {
+    supabase
+      .from('vehicles')
+      .select('*')
+      .order('vehicle_code', { ascending: true })
+      .then(({ data }) => {
+        if (data && data.length > 0) {
+          const active = data.find((v) => v.assigned_incident_id) || data[0];
+          setAssignedUnit(active);
+        }
+      });
+  }, []);
 
   return (
     <div className="min-h-screen bg-sky-50/40 text-slate-900 flex flex-col font-sans">
@@ -22,12 +34,14 @@ export const ResponderLayout: React.FC<{ children: React.ReactNode }> = ({ child
             </div>
             <div>
               <div className="flex items-center space-x-2">
-                <span className="font-extrabold text-slate-900 tracking-wider">UNIT: {assignedUnit?.vehicle_code}</span>
+                <span className="font-extrabold text-slate-900 tracking-wider">
+                  UNIT: {assignedUnit?.vehicle_code || 'TAC-01'}
+                </span>
                 <span className="text-xs px-2 py-0.5 rounded-lg bg-emerald-50 text-emerald-800 border border-emerald-200 font-bold uppercase">
-                  {assignedUnit?.status.toUpperCase()}
+                  {String(assignedUnit?.status || 'ONLINE').toUpperCase()}
                 </span>
               </div>
-              <p className="text-xs text-slate-500 font-medium">{assignedUnit?.name}</p>
+              <p className="text-xs text-slate-500 font-medium">{assignedUnit?.name || 'Emergency Responder Unit'}</p>
             </div>
           </div>
 

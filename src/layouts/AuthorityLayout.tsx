@@ -3,9 +3,10 @@
  * Clean responsive design for mobile (375px, 390px), tablet (768px), and desktop (1280px+).
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { useApp } from '../context/AppContext';
+import { supabase } from '../lib/supabase';
+import { realtimeService } from '../services/realtimeService';
 import { useAuth } from '../context/AuthContext';
 import {
   LayoutDashboard,
@@ -26,30 +27,89 @@ import {
 } from 'lucide-react';
 
 export const AuthorityLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { incidents, vehicles, reports, notifications } = useApp();
   const { user, profile, signOut } = useAuth();
   const location = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const activeIncidents = incidents.filter((i) => i.status !== 'resolved' && i.status !== 'closed');
-  const criticalIncidents = activeIncidents.filter((i) => i.priority === 'critical');
-  const pendingReports = reports.filter((r) => r.status === 'submitted' || r.status === 'ai_analyzed');
-  const availableVehicles = vehicles.filter((v) => v.status === 'available');
-  const unreadNotifs = notifications.filter((n) => !n.is_read);
+  const [dbPendingReportsCount, setDbPendingReportsCount] = useState(0);
+  const [dbActiveIncidentsCount, setDbActiveIncidentsCount] = useState(0);
+  const [dbCriticalIncidentsCount, setDbCriticalIncidentsCount] = useState(0);
+  const [dbAvailableFleetCount, setDbAvailableFleetCount] = useState(0);
+  const [dbTotalFleetCount, setDbTotalFleetCount] = useState(0);
+  const [dbUnreadNotifsCount, setDbUnreadNotifsCount] = useState(0);
+
+  const fetchLiveCounts = async () => {
+    try {
+      const [repRes, incRes, critRes, vehRes, totVehRes, notifRes] = await Promise.all([
+        supabase
+          .from('emergency_reports')
+          .select('id', { count: 'exact', head: true })
+          .or('status.eq.submitted,status.eq.ai_analyzed'),
+        supabase
+          .from('incidents')
+          .select('id', { count: 'exact', head: true })
+          .neq('status', 'resolved')
+          .neq('status', 'closed'),
+        supabase
+          .from('incidents')
+          .select('id', { count: 'exact', head: true })
+          .eq('priority', 'critical')
+          .neq('status', 'resolved')
+          .neq('status', 'closed'),
+        supabase
+          .from('vehicles')
+          .select('id', { count: 'exact', head: true })
+          .eq('status', 'available'),
+        supabase
+          .from('vehicles')
+          .select('id', { count: 'exact', head: true }),
+        supabase
+          .from('notifications')
+          .select('id', { count: 'exact', head: true })
+          .eq('is_read', false),
+      ]);
+
+      setDbPendingReportsCount(repRes.count || 0);
+      setDbActiveIncidentsCount(incRes.count || 0);
+      setDbCriticalIncidentsCount(critRes.count || 0);
+      setDbAvailableFleetCount(vehRes.count || 0);
+      setDbTotalFleetCount(totVehRes.count || 0);
+      setDbUnreadNotifsCount(notifRes.count || 0);
+    } catch (err) {
+      console.error('Error fetching live layout counts:', err);
+    }
+  };
+
+  useEffect(() => {
+    fetchLiveCounts();
+
+    const { unsubscribe } = realtimeService.subscribeToOperationalChanges(
+      'authority-layout-channel',
+      ['emergency_reports', 'incidents', 'vehicles'],
+      () => {
+        fetchLiveCounts();
+      }
+    );
+
+    return () => {
+      unsubscribe();
+    };
+  }, []);
 
   const navItems = [
     { label: 'Dashboard', path: '/authority', icon: LayoutDashboard },
-    { label: 'Citizen Reports', path: '/authority/reports', icon: FileText, count: pendingReports.length },
-    { label: 'Incidents Workspace', path: '/authority/incidents', icon: AlertTriangle, count: activeIncidents.length },
+    { label: 'Citizen Reports', path: '/authority/reports', icon: FileText, count: dbPendingReportsCount },
+    { label: 'Incidents Workspace', path: '/authority/incidents', icon: AlertTriangle, count: dbActiveIncidentsCount },
     { label: 'Live Operations Map', path: '/authority/map', icon: MapPin },
-    { label: 'Vehicle Fleet', path: '/authority/vehicles', icon: Truck, count: availableVehicles.length },
+    { label: 'Vehicle Fleet', path: '/authority/vehicles', icon: Truck, count: dbAvailableFleetCount },
     { label: 'Response Teams', path: '/authority/teams', icon: Users },
     { label: 'Analytics', path: '/authority/analytics', icon: BarChart3 },
     { label: 'AI Audit Logs', path: '/authority/ai-logs', icon: Bot },
     { label: 'System & Audit', path: '/authority/system-audit', icon: ShieldCheck },
   ];
 
-  const isActive = (path: string) => location.pathname === path;
+  const isActive = (path: string) =>
+    location.pathname === path || (path !== '/authority' && location.pathname.startsWith(path));
 
   return (
     <div className="min-h-screen bg-sky-50/40 text-slate-900 flex flex-col font-sans">
@@ -84,17 +144,17 @@ export const AuthorityLayout: React.FC<{ children: React.ReactNode }> = ({ child
             <div className="flex items-center space-x-2 bg-sky-50 px-3 py-1.5 rounded-lg border border-sky-200">
               <span className="w-2.5 h-2.5 bg-red-500 rounded-full animate-ping" />
               <span className="text-slate-600 font-semibold">Active:</span>
-              <span className="font-extrabold text-slate-900 text-sm">{activeIncidents.length}</span>
+              <span className="font-extrabold text-slate-900 text-sm">{dbActiveIncidentsCount}</span>
             </div>
 
             <div className="flex items-center space-x-2 bg-amber-50 px-3 py-1.5 rounded-lg border border-amber-200">
               <span className="text-amber-800 font-bold">Critical:</span>
-              <span className="font-extrabold text-amber-900 text-sm">{criticalIncidents.length}</span>
+              <span className="font-extrabold text-amber-900 text-sm">{dbCriticalIncidentsCount}</span>
             </div>
 
             <div className="flex items-center space-x-2 bg-emerald-50 px-3 py-1.5 rounded-lg border border-emerald-200">
               <span className="text-emerald-800 font-semibold">Available Fleet:</span>
-              <span className="font-extrabold text-emerald-900 text-sm">{availableVehicles.length} / {vehicles.length}</span>
+              <span className="font-extrabold text-emerald-900 text-sm">{dbAvailableFleetCount} / {dbTotalFleetCount}</span>
             </div>
           </div>
 
@@ -102,9 +162,9 @@ export const AuthorityLayout: React.FC<{ children: React.ReactNode }> = ({ child
             <div className="relative">
               <button className="p-2 rounded-lg bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 relative">
                 <Bell className="w-4 h-4 sm:w-5 sm:h-5" />
-                {unreadNotifs.length > 0 && (
+                {dbUnreadNotifsCount > 0 && (
                   <span className="absolute -top-1 -right-1 bg-red-600 text-white text-[10px] font-bold rounded-full w-4 h-4 flex items-center justify-center">
-                    {unreadNotifs.length}
+                    {dbUnreadNotifsCount}
                   </span>
                 )}
               </button>

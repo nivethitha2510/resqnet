@@ -23,65 +23,83 @@ class RealtimeService {
 
   /**
    * Subscribes to Supabase Realtime postgres_changes for specified tables.
+   * Guarantees all postgres_changes handlers are registered BEFORE subscribe().
    */
   public subscribeToOperationalChanges(
-    channelName: string,
-    tables: Array<'vehicles' | 'incidents' | 'incident_resources' | 'vehicle_status_history' | 'emergency_reports' | 'ai_audit_logs' | 'audit_logs'>,
+    channelPrefix: string,
+    tables: Array<'vehicles' | 'incidents' | 'incident_resources' | 'vehicle_status_history' | 'emergency_reports' | 'ai_audit_logs' | 'audit_logs' | 'notifications'>,
     onPayload: RealtimeCallback,
-    customClient?: any
+    customClient?: any,
+    onStatusChange?: (status: string) => void
   ): { unsubscribe: () => Promise<void>; channel: RealtimeChannel } {
     const client = customClient || supabase;
 
-    if (this.activeChannels.has(channelName)) {
-      const existingChannel = this.activeChannels.get(channelName)!;
-      return {
-        unsubscribe: async () => {
-          await client.removeChannel(existingChannel);
-          this.activeChannels.delete(channelName);
-        },
-        channel: existingChannel,
-      };
-    }
-
-    let channel = client.channel(channelName);
-
-    for (const table of tables) {
-      channel = channel.on(
-        'postgres_changes' as any,
-        {
-          event: '*',
-          schema: 'public',
-          table,
-        },
-        (payload: any) => {
-          onPayload({
-            eventType: payload.eventType,
-            table: payload.table,
-            new: payload.new || {},
-            old: payload.old || {},
-            commit_timestamp: payload.commit_timestamp,
-          });
-        }
-      );
-    }
-
-    channel.subscribe((status: string, err?: Error) => {
-      if (status === 'SUBSCRIBED') {
-        console.log(`[Supabase Realtime] Subscribed to channel '${channelName}' for tables: ${tables.join(', ')}`);
-      } else if (status === 'CLOSED') {
-        console.log(`[Supabase Realtime] Channel '${channelName}' closed.`);
-      } else if (status === 'CHANNEL_ERROR') {
-        console.error(`[Supabase Realtime] Error on channel '${channelName}':`, err);
+    // Clean up any existing channel registered under this key
+    if (this.activeChannels.has(channelPrefix)) {
+      const existingChannel = this.activeChannels.get(channelPrefix)!;
+      try {
+        client.removeChannel(existingChannel);
+      } catch (err) {
+        console.warn(`[Supabase Realtime] Could not cleanly remove old channel for ${channelPrefix}:`, err);
       }
-    });
+      this.activeChannels.delete(channelPrefix);
+    }
 
-    this.activeChannels.set(channelName, channel);
+    // Generate unique topic to guarantee a fresh, un-subscribed channel instance from Supabase client
+    const uniqueChannelName = `${channelPrefix}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    let channel: RealtimeChannel;
+
+    try {
+      channel = client.channel(uniqueChannelName);
+
+      // Register ALL postgres_changes handlers BEFORE calling subscribe()
+      for (const table of tables) {
+        channel = channel.on(
+          'postgres_changes' as any,
+          {
+            event: '*',
+            schema: 'public',
+            table,
+          },
+          (payload: any) => {
+            onPayload({
+              eventType: payload.eventType,
+              table: payload.table,
+              new: payload.new || {},
+              old: payload.old || {},
+              commit_timestamp: payload.commit_timestamp,
+            });
+          }
+        );
+      }
+
+      // Call subscribe() exactly once AFTER all listeners are registered
+      channel.subscribe((status: string, err?: Error) => {
+        if (onStatusChange) {
+          onStatusChange(status);
+        }
+        if (status === 'SUBSCRIBED') {
+          console.log(`[Supabase Realtime] Subscribed to '${uniqueChannelName}' for tables: ${tables.join(', ')}`);
+        } else if (status === 'CLOSED') {
+          console.log(`[Supabase Realtime] Channel '${uniqueChannelName}' closed.`);
+        } else if (status === 'CHANNEL_ERROR') {
+          console.warn(`[Supabase Realtime] Channel error on '${uniqueChannelName}':`, err);
+        }
+      });
+
+      this.activeChannels.set(channelPrefix, channel);
+    } catch (err) {
+      console.error(`[Supabase Realtime] Setup error on '${channelPrefix}':`, err);
+      channel = client.channel(uniqueChannelName);
+    }
 
     const unsubscribe = async () => {
-      if (this.activeChannels.has(channelName)) {
+      try {
         await client.removeChannel(channel);
-        this.activeChannels.delete(channelName);
-        console.log(`[Supabase Realtime] Unsubscribed channel '${channelName}'.`);
+        this.activeChannels.delete(channelPrefix);
+        console.log(`[Supabase Realtime] Unsubscribed channel '${uniqueChannelName}'.`);
+      } catch (err) {
+        console.warn(`[Supabase Realtime] Unsubscribe warning on '${uniqueChannelName}':`, err);
       }
     };
 
@@ -94,8 +112,12 @@ class RealtimeService {
   public async cleanupAll(customClient?: any): Promise<void> {
     const client = customClient || supabase;
     for (const [name, channel] of this.activeChannels.entries()) {
-      await client.removeChannel(channel);
-      console.log(`[Supabase Realtime] Cleaned up channel '${name}'.`);
+      try {
+        await client.removeChannel(channel);
+        console.log(`[Supabase Realtime] Cleaned up channel '${name}'.`);
+      } catch (err) {
+        console.warn(`[Supabase Realtime] Cleanup error on '${name}':`, err);
+      }
     }
     this.activeChannels.clear();
   }

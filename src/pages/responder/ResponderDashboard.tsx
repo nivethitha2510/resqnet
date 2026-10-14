@@ -4,7 +4,7 @@
  * Executes live status transitions (en_route -> on_scene -> in_progress -> resolved).
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { supabase } from '../../lib/supabase';
 import { realtimeService } from '../../services/realtimeService';
 import { ModularMap } from '../../components/map/ModularMap';
@@ -14,6 +14,7 @@ import type { IncidentStatus, VehicleStatus } from '../../types/domain';
 export const ResponderDashboard: React.FC = () => {
   const [vehicles, setVehicles] = useState<any[]>([]);
   const [selectedVehicle, setSelectedVehicle] = useState<any | null>(null);
+  const selectedVehicleRef = useRef<any | null>(null);
   const [assignedIncident, setAssignedIncident] = useState<any | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -34,11 +35,12 @@ export const ResponderDashboard: React.FC = () => {
       setVehicles(vehData || []);
 
       // Select active vehicle (first vehicle assigned or active, or fallback first unit)
-      const currentVeh = selectedVehicle
-        ? vehData?.find((v) => v.id === selectedVehicle.id) || vehData?.[0]
+      const currentVeh = selectedVehicleRef.current
+        ? vehData?.find((v) => v.id === selectedVehicleRef.current.id) || vehData?.[0]
         : vehData?.find((v) => v.assigned_incident_id) || vehData?.[0];
 
       setSelectedVehicle(currentVeh || null);
+      selectedVehicleRef.current = currentVeh || null;
 
       // 2. Fetch Assigned Incident if vehicle is allocated
       if (currentVeh?.assigned_incident_id) {
@@ -86,7 +88,7 @@ export const ResponderDashboard: React.FC = () => {
     return () => {
       unsubscribe();
     };
-  }, [selectedVehicle?.id]);
+  }, []);
 
   const handleSetStatus = async (newVehStatus: VehicleStatus, newIncStatus: IncidentStatus) => {
     if (!selectedVehicle) return;
@@ -128,9 +130,21 @@ export const ResponderDashboard: React.FC = () => {
           incUpdate.resolved_at = timestamp;
 
           // Also update linked emergency reports to 'resolved'
-          await supabase
+          const { error: rErr } = await supabase
             .from('emergency_reports')
-            .update({ status: 'resolved' })
+            .update({ status: 'resolved', updated_at: timestamp })
+            .eq('incident_id', incId);
+          if (rErr) console.warn('Report resolve warning:', rErr.message);
+
+          // Update incident resources
+          await supabase
+            .from('incident_resources')
+            .update({ status: 'delivered' })
+            .eq('incident_id', incId);
+        } else if (newIncStatus === 'on_scene') {
+          await supabase
+            .from('incident_resources')
+            .update({ status: 'on_scene' })
             .eq('incident_id', incId);
         }
 
@@ -139,7 +153,9 @@ export const ResponderDashboard: React.FC = () => {
           .update(incUpdate)
           .eq('id', incId);
 
-        if (iErr) console.warn('Incident update warning:', iErr.message);
+        if (iErr) {
+          throw new Error(`Incident update failed in PostgreSQL: ${iErr.message}`);
+        }
 
         // 3. Log vehicle status history
         await supabase.from('vehicle_status_history').insert({
@@ -167,6 +183,14 @@ export const ResponderDashboard: React.FC = () => {
             new_incident_status: newIncStatus,
             timestamp,
           },
+        });
+
+        // 5. Insert notification for incident tracking
+        await supabase.from('notifications').insert({
+          title: `Unit ${selectedVehicle.vehicle_code}: ${newVehStatus.replace('_', ' ').toUpperCase()}`,
+          message: `Unit ${selectedVehicle.vehicle_code} transitioned to ${newVehStatus.replace('_', ' ').toUpperCase()} for incident ${assignedIncident?.code || ''}`,
+          incident_id: incId,
+          type: 'operational_update',
         });
       }
 
@@ -228,7 +252,18 @@ export const ResponderDashboard: React.FC = () => {
                 value={selectedVehicle?.id || ''}
                 onChange={(e) => {
                   const found = vehicles.find((v) => v.id === e.target.value);
-                  if (found) setSelectedVehicle(found);
+                  if (found) {
+                    setSelectedVehicle(found);
+                    selectedVehicleRef.current = found;
+                    if (found.assigned_incident_id) {
+                      supabase
+                        .from('incidents')
+                        .select('*')
+                        .eq('id', found.assigned_incident_id)
+                        .maybeSingle()
+                        .then(({ data: incData }) => setAssignedIncident(incData || null));
+                    }
+                  }
                 }}
                 className="bg-slate-900 border border-slate-700 text-white font-mono font-black text-sm rounded-lg px-2 py-1"
               >

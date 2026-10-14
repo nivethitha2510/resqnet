@@ -22,7 +22,8 @@ export type ReportStatus =
   | 'ai_analyzed'
   | 'verified'
   | 'linked_to_incident'
-  | 'rejected';
+  | 'rejected'
+  | 'resolved';
 
 export type IncidentStatus = 
   | 'open'

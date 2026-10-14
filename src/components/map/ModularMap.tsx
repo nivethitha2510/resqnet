@@ -1,5 +1,6 @@
 /**
  * Modular Map Component
+ * Hardened against invalid/null coordinates to prevent Leaflet render crashes.
  */
 
 import React from 'react';
@@ -14,6 +15,25 @@ L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
   shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
 });
+
+const DEFAULT_CENTER: [number, number] = [13.0827, 80.2707]; // Chennai coordinates fallback
+
+function isValidCoordinate(lat: any, lng: any): boolean {
+  if (lat === null || lat === undefined || lng === null || lng === undefined) return false;
+  const numLat = Number(lat);
+  const numLng = Number(lng);
+  return (
+    !isNaN(numLat) &&
+    !isNaN(numLng) &&
+    isFinite(numLat) &&
+    isFinite(numLng) &&
+    numLat >= -90 &&
+    numLat <= 90 &&
+    numLng >= -180 &&
+    numLng <= 180 &&
+    !(numLat === 0 && numLng === 0)
+  );
+}
 
 const createCustomMarker = (color: string, label: string) => {
   return L.divIcon({
@@ -39,7 +59,7 @@ const createCustomMarker = (color: string, label: string) => {
 };
 
 interface ModularMapProps {
-  center?: LocationCoordinates;
+  center?: LocationCoordinates | null;
   zoom?: number;
   incidents?: Incident[];
   reports?: EmergencyReport[];
@@ -65,7 +85,7 @@ const LocationPickerMarker: React.FC<{ onSelect: (loc: LocationCoordinates) => v
 };
 
 export const ModularMap: React.FC<ModularMapProps> = ({
-  center = { latitude: 13.0827, longitude: 80.2707 },
+  center,
   zoom = 13,
   incidents = [],
   reports = [],
@@ -76,11 +96,36 @@ export const ModularMap: React.FC<ModularMapProps> = ({
   height = '400px',
   className = '',
 }) => {
-  const mapCenter: [number, number] = [center.latitude, center.longitude];
+  const safeCenter: [number, number] =
+    center && isValidCoordinate(center.latitude, center.longitude)
+      ? [Number(center.latitude), Number(center.longitude)]
+      : DEFAULT_CENTER;
+
+  const validPin =
+    selectedLocationPin && isValidCoordinate(selectedLocationPin.latitude, selectedLocationPin.longitude)
+      ? {
+          lat: Number(selectedLocationPin.latitude),
+          lng: Number(selectedLocationPin.longitude),
+          address: selectedLocationPin.address || 'Selected Location',
+        }
+      : null;
+
+  const validIncidents = (incidents || []).filter(
+    (inc) => inc && inc.location && isValidCoordinate(inc.location.latitude, inc.location.longitude)
+  );
+
+  const validReports = (reports || []).filter(
+    (rep) => rep && rep.location && isValidCoordinate(rep.location.latitude, rep.location.longitude)
+  );
+
+  const validVehicles = (vehicles || []).filter(
+    (veh) =>
+      veh && veh.current_location && isValidCoordinate(veh.current_location.latitude, veh.current_location.longitude)
+  );
 
   return (
     <div style={{ height }} className={`relative overflow-hidden rounded-xl border border-slate-200 shadow-sm ${className}`}>
-      <MapContainer center={mapCenter} zoom={zoom} scrollWheelZoom={false} style={{ height: '100%', width: '100%' }}>
+      <MapContainer center={safeCenter} zoom={zoom} scrollWheelZoom={false} style={{ height: '100%', width: '100%' }}>
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -90,24 +135,24 @@ export const ModularMap: React.FC<ModularMapProps> = ({
           <LocationPickerMarker onSelect={onLocationSelect} />
         )}
 
-        {selectedLocationPin && (
+        {validPin && (
           <Marker
-            position={[selectedLocationPin.latitude, selectedLocationPin.longitude]}
+            position={[validPin.lat, validPin.lng]}
             icon={createCustomMarker('#ef4444', '📍')}
           >
             <Popup>
               <div className="p-1">
                 <p className="font-semibold text-slate-900 text-xs">Selected Location</p>
-                <p className="text-slate-600 text-xs">{selectedLocationPin.address || 'Custom Map Pin'}</p>
+                <p className="text-slate-600 text-xs">{validPin.address}</p>
               </div>
             </Popup>
           </Marker>
         )}
 
-        {incidents.map((inc) => (
+        {validIncidents.map((inc) => (
           <Marker
             key={inc.id}
-            position={[inc.location.latitude, inc.location.longitude]}
+            position={[Number(inc.location.latitude), Number(inc.location.longitude)]}
             icon={createCustomMarker(
               inc.priority === 'critical' ? '#dc2626' : inc.priority === 'high' ? '#f59e0b' : '#3b82f6',
               '🚨'
@@ -118,38 +163,38 @@ export const ModularMap: React.FC<ModularMapProps> = ({
                 <span className={`inline-block px-2 py-0.5 text-xs font-semibold rounded text-white ${
                   inc.priority === 'critical' ? 'bg-red-600' : 'bg-amber-600'
                 }`}>
-                  {inc.priority.toUpperCase()} • {inc.emergency_type.toUpperCase()}
+                  {String(inc.priority || 'medium').toUpperCase()} • {String(inc.emergency_type || 'emergency').toUpperCase()}
                 </span>
-                <h4 className="font-bold text-slate-900 text-sm">{inc.title}</h4>
-                <p className="text-xs text-slate-600">{inc.location.address}</p>
-                <p className="text-xs text-slate-700 font-medium">Status: {inc.status.toUpperCase()}</p>
+                <h4 className="font-bold text-slate-900 text-sm">{inc.title || 'Incident'}</h4>
+                <p className="text-xs text-slate-600">{inc.location.address || 'Location unavailable'}</p>
+                <p className="text-xs text-slate-700 font-medium">Status: {String(inc.status || 'open').toUpperCase()}</p>
               </div>
             </Popup>
           </Marker>
         ))}
 
-        {reports.map((rep) => (
+        {validReports.map((rep) => (
           <Marker
             key={rep.id}
-            position={[rep.location.latitude, rep.location.longitude]}
+            position={[Number(rep.location.latitude), Number(rep.location.longitude)]}
             icon={createCustomMarker('#6366f1', '📣')}
           >
             <Popup>
               <div className="p-2 space-y-1">
                 <span className="text-xs font-semibold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800">
-                  REPORT {rep.id}
+                  REPORT {rep.id ? rep.id.slice(0, 8) : ''}
                 </span>
-                <p className="text-xs font-bold text-slate-900">{rep.ai_summary || rep.raw_text}</p>
-                <p className="text-xs text-slate-500">{rep.location.address}</p>
+                <p className="text-xs font-bold text-slate-900">{rep.ai_summary || rep.raw_text || 'Report'}</p>
+                <p className="text-xs text-slate-500">{rep.location.address || 'Location unavailable'}</p>
               </div>
             </Popup>
           </Marker>
         ))}
 
-        {vehicles.map((veh) => (
+        {validVehicles.map((veh) => (
           <Marker
             key={veh.id}
-            position={[veh.current_location.latitude, veh.current_location.longitude]}
+            position={[Number(veh.current_location.latitude), Number(veh.current_location.longitude)]}
             icon={createCustomMarker(veh.status === 'en_route' ? '#10b981' : '#64748b', '🚒')}
           >
             <Popup>
@@ -157,10 +202,10 @@ export const ModularMap: React.FC<ModularMapProps> = ({
                 <span className={`text-xs font-semibold px-2 py-0.5 rounded text-white ${
                   veh.status === 'en_route' ? 'bg-emerald-600' : 'bg-slate-700'
                 }`}>
-                  {veh.vehicle_code} • {veh.status.toUpperCase()}
+                  {veh.vehicle_code} • {String(veh.status || 'available').toUpperCase()}
                 </span>
                 <p className="text-xs font-bold text-slate-900">{veh.name}</p>
-                <p className="text-xs text-slate-500">{veh.current_location.address}</p>
+                <p className="text-xs text-slate-500">{veh.current_location.address || 'Fleet Location'}</p>
               </div>
             </Popup>
           </Marker>

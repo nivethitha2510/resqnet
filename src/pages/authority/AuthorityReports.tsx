@@ -4,12 +4,26 @@
  * Uses deduplicating clusteringService to prevent duplicate incident creation.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '../../lib/supabase';
 import { realtimeService } from '../../services/realtimeService';
 import { clusteringService } from '../../services/clusteringService';
-import { XCircle, Loader2, AlertCircle, Radio, MapPin, Clock, Bot, Layers, ArrowRight } from 'lucide-react';
+import { authorityService } from '../../services/authorityService';
+import {
+  XCircle,
+  Loader2,
+  AlertCircle,
+  Radio,
+  MapPin,
+  Clock,
+  Bot,
+  Layers,
+  ArrowRight,
+  Check,
+  CheckCircle2,
+  Eye,
+} from 'lucide-react';
 
 export const AuthorityReports: React.FC = () => {
   const navigate = useNavigate();
@@ -20,7 +34,7 @@ export const AuthorityReports: React.FC = () => {
   const [realtimeStatus, setRealtimeStatus] = useState<'LIVE' | 'CONNECTING'>('CONNECTING');
   const [isProcessing, setIsProcessing] = useState<string | null>(null);
 
-  const fetchReports = async () => {
+  const fetchReports = useCallback(async () => {
     try {
       const { data, error: fetchErr } = await supabase
         .from('emergency_reports')
@@ -35,27 +49,80 @@ export const AuthorityReports: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchReports();
 
     const { unsubscribe } = realtimeService.subscribeToOperationalChanges(
       'authority-reports-channel',
-      ['emergency_reports'],
+      ['emergency_reports', 'incidents'],
       () => {
-        setRealtimeStatus('LIVE');
         fetchReports();
+      },
+      undefined,
+      (status) => {
+        if (status === 'SUBSCRIBED') {
+          setRealtimeStatus('LIVE');
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          setRealtimeStatus('CONNECTING');
+        }
       }
     );
-    setRealtimeStatus('LIVE');
 
     return () => {
       unsubscribe();
     };
-  }, []);
+  }, [fetchReports]);
 
-  const handleClusterReport = async (reportId: string, existingIncidentId?: string | null) => {
+  const handleApproveReport = useCallback(async (report: any) => {
+    setIsProcessing(report.id);
+    setError(null);
+    setActionNotice(null);
+
+    try {
+      let incidentId = report.incident_id;
+
+      // 1. If not yet linked to incident, cluster report into a unified incident
+      if (!incidentId) {
+        const inc = await clusteringService.clusterReport(report.id);
+        if (inc) {
+          incidentId = inc.id;
+        }
+      }
+
+      // 2. Approve incident in Supabase PostgreSQL via Authority verification service
+      if (incidentId) {
+        await authorityService.approveRecommendation(incidentId);
+      }
+
+      // 3. Mark report as verified in public.emergency_reports
+      const { error: repUpdateErr } = await supabase
+        .from('emergency_reports')
+        .update({
+          status: 'verified',
+          incident_id: incidentId || report.incident_id,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', report.id);
+
+      if (repUpdateErr) {
+        throw new Error(`Failed to update report status: ${repUpdateErr.message}`);
+      }
+
+      setActionNotice(
+        `Report #${report.report_number || report.id.slice(0, 8)} APPROVED & VERIFIED in Supabase database.`
+      );
+      await fetchReports();
+    } catch (err: any) {
+      console.error('Error approving report:', err);
+      setError(err.message || 'Failed to approve report.');
+    } finally {
+      setIsProcessing(null);
+    }
+  }, [fetchReports]);
+
+  const handleClusterReport = useCallback(async (reportId: string, existingIncidentId?: string | null) => {
     if (existingIncidentId) {
       navigate(`/authority/incidents?id=${existingIncidentId}`);
       return;
@@ -79,19 +146,23 @@ export const AuthorityReports: React.FC = () => {
     } finally {
       setIsProcessing(null);
     }
-  };
+  }, [navigate, fetchReports]);
 
-  const handleRejectReport = async (reportId: string) => {
+  const handleRejectReport = useCallback(async (reportId: string, existingIncidentId?: string | null) => {
     setIsProcessing(reportId);
     setError(null);
     setActionNotice(null);
     try {
       const { error: updateErr } = await supabase
         .from('emergency_reports')
-        .update({ status: 'rejected' })
+        .update({ status: 'rejected', updated_at: new Date().toISOString() })
         .eq('id', reportId);
 
       if (updateErr) throw new Error(updateErr.message);
+
+      if (existingIncidentId) {
+        await authorityService.rejectRecommendation(existingIncidentId, 'Report rejected by authority officer.');
+      }
 
       setActionNotice(`Report #${reportId.slice(0, 8)} REJECTED in database.`);
       await fetchReports();
@@ -101,7 +172,7 @@ export const AuthorityReports: React.FC = () => {
     } finally {
       setIsProcessing(null);
     }
-  };
+  }, [fetchReports]);
 
   if (isLoading) {
     return (
@@ -131,8 +202,9 @@ export const AuthorityReports: React.FC = () => {
       </div>
 
       {actionNotice && (
-        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-xs text-emerald-800 font-medium">
-          {actionNotice}
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-xs text-emerald-800 font-medium flex items-center space-x-2">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          <span>{actionNotice}</span>
         </div>
       )}
 
@@ -172,14 +244,16 @@ export const AuthorityReports: React.FC = () => {
                 <div className="flex items-center space-x-2">
                   <span
                     className={`text-xs px-2.5 py-1 font-bold rounded ${
-                      rep.status === 'verified' || rep.status === 'linked_to_incident' || rep.incident_id
+                      rep.status === 'verified'
                         ? 'bg-emerald-100 text-emerald-800'
+                        : rep.status === 'linked_to_incident' || rep.incident_id
+                        ? 'bg-blue-100 text-blue-800'
                         : rep.status === 'rejected'
                         ? 'bg-slate-200 text-slate-600 line-through'
                         : 'bg-amber-100 text-amber-800'
                     }`}
                   >
-                    STATUS: {rep.incident_id ? 'LINKED TO INCIDENT' : String(rep.status).toUpperCase()}
+                    STATUS: {rep.status === 'verified' ? 'VERIFIED' : rep.incident_id ? 'LINKED TO INCIDENT' : String(rep.status).toUpperCase()}
                   </span>
                   <span className="text-[10px] text-slate-400 flex items-center space-x-1">
                     <Clock className="w-3 h-3" />
@@ -223,10 +297,10 @@ export const AuthorityReports: React.FC = () => {
               </div>
 
               {rep.status !== 'rejected' && (
-                <div className="flex items-center justify-end space-x-3 pt-2 border-t border-slate-100">
+                <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-slate-100">
                   <button
                     type="button"
-                    onClick={() => handleRejectReport(rep.id)}
+                    onClick={() => handleRejectReport(rep.id, rep.incident_id)}
                     disabled={isProcessing === rep.id}
                     className="inline-flex items-center space-x-1.5 text-xs font-bold text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 px-3 py-2 rounded-lg transition-colors disabled:opacity-50"
                   >
@@ -234,14 +308,32 @@ export const AuthorityReports: React.FC = () => {
                     <span>Reject Report</span>
                   </button>
 
+                  {rep.status !== 'verified' && (
+                    <button
+                      type="button"
+                      onClick={() => handleApproveReport(rep)}
+                      disabled={isProcessing === rep.id}
+                      className="inline-flex items-center space-x-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 px-3.5 py-2 rounded-lg shadow-sm transition-all disabled:opacity-50"
+                    >
+                      {isProcessing === rep.id ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Check className="w-4 h-4" />
+                      )}
+                      <span>Approve & Verify</span>
+                    </button>
+                  )}
+
                   {rep.incident_id ? (
                     <button
                       type="button"
                       onClick={() => navigate(`/authority/incidents?id=${rep.incident_id}`)}
                       className="inline-flex items-center space-x-1.5 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 px-4 py-2 rounded-lg shadow-sm transition-all"
+                      title="Open incident workspace for this report"
                     >
-                      <span>View Linked Incident</span>
-                      <ArrowRight className="w-4 h-4 text-red-500" />
+                      <Eye className="w-4 h-4 text-red-500" />
+                      <span>View Incident</span>
+                      <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
                     </button>
                   ) : (
                     <button

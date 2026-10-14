@@ -2,10 +2,13 @@
  * Authority Incidents Workspace Page (Phase 3C)
  * Queries real incidents from Supabase PostgreSQL `public.incidents`
  * and supporting reports linked via `public.incident_reports`.
+ * Hardened to prevent blank/white screen crashes under all routing, null-data,
+ * and edge-case conditions.
  */
 
-import React, { useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import React, { useEffect, useState, useRef } from 'react';
+import { useSearchParams, useParams, useNavigate } from 'react-router-dom';
+import type { RealtimeChannel } from '@supabase/supabase-js';
 import { supabase } from '../../lib/supabase';
 import { clusteringService } from '../../services/clusteringService';
 import { priorityService } from '../../services/priorityService';
@@ -13,8 +16,8 @@ import { authorityService } from '../../services/authorityService';
 import { vehicleAllocationService } from '../../services/vehicleAllocationService';
 import type { IncidentAllocationSummary } from '../../services/vehicleAllocationService';
 import { dispatchService } from '../../services/dispatchService';
-import { realtimeService } from '../../services/realtimeService';
 import { ModularMap } from '../../components/map/ModularMap';
+import { ErrorBoundary } from '../../components/common/ErrorBoundary';
 import type { IncidentStatus, EmergencyType, PriorityLevel } from '../../types/domain';
 import {
   AlertTriangle,
@@ -78,16 +81,22 @@ interface DBReport {
 }
 
 export const AuthorityIncidents: React.FC = () => {
-  const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const { id: routeId } = useParams<{ id?: string }>();
+  const [searchParams] = useSearchParams();
+  const queryId = searchParams.get('id');
+  const targetId = routeId || queryId;
+
   const [incidents, setIncidents] = useState<DBIncident[]>([]);
+  const [targetIncident, setTargetIncident] = useState<DBIncident | null>(null);
+  const [targetNotFound, setTargetNotFound] = useState(false);
+  const [isResolvingTarget, setIsResolvingTarget] = useState(false);
+
   const [supportingReports, setSupportingReports] = useState<DBReport[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isClustering, setIsClustering] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [clusterNotice, setClusterNotice] = useState<string | null>(null);
-
-  const selectedId = searchParams.get('id');
-  const currentIncident = incidents.find((i) => i.id === selectedId) || incidents[0];
 
   const [activeTab, setActiveTab] = useState<'overview' | 'clustering' | 'verification' | 'allocation'>('overview');
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
@@ -101,39 +110,55 @@ export const AuthorityIncidents: React.FC = () => {
   const [selectedModifyPriority, setSelectedModifyPriority] = useState<PriorityLevel>('high');
   const [authorityReasonInput, setAuthorityReasonInput] = useState('');
 
-  useEffect(() => {
-    fetchIncidents();
-  }, []);
+  const fetchIncidents = async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const { data, error: fetchErr } = await supabase
+        .from('incidents')
+        .select('*')
+        .order('created_at', { ascending: false });
 
-  useEffect(() => {
-    if (currentIncident?.id) {
-      fetchSupportingReports(currentIncident.id);
-      fetchAuditLogs(currentIncident.id);
-      fetchAllocations(currentIncident.id);
-    }
-  }, [currentIncident?.id]);
-
-  // Realtime Supabase Subscription Effect
-  useEffect(() => {
-    const { unsubscribe } = realtimeService.subscribeToOperationalChanges(
-      'authority-incidents-channel',
-      ['vehicles', 'incidents', 'incident_resources', 'vehicle_status_history'],
-      (payload) => {
-        console.log('[Supabase Realtime Payload Received]:', payload);
-        setRealtimeStatus('LIVE');
-        fetchIncidents();
-        if (currentIncident?.id) {
-          fetchAllocations(currentIncident.id);
-          fetchAuditLogs(currentIncident.id);
-        }
+      if (fetchErr) {
+        throw new Error(fetchErr.message);
       }
-    );
-    setRealtimeStatus('LIVE');
 
-    return () => {
-      unsubscribe();
-    };
-  }, [currentIncident?.id]);
+      setIncidents(data || []);
+    } catch (err: any) {
+      console.error('Error fetching incidents:', err);
+      setError(err.message || 'Could not load incidents from Supabase.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const fetchSupportingReports = async (incidentId: string) => {
+    try {
+      const { data, error: repErr } = await supabase
+        .from('emergency_reports')
+        .select('id, report_number, emergency_type, description, location_text, people_affected, people_injured, people_trapped, created_at, ai_summary')
+        .eq('incident_id', incidentId)
+        .order('created_at', { ascending: true });
+
+      if (repErr) {
+        console.error('Error fetching supporting reports:', repErr);
+        return;
+      }
+
+      setSupportingReports(data || []);
+    } catch (err) {
+      console.error('Error in fetchSupportingReports:', err);
+    }
+  };
+
+  const fetchAuditLogs = async (incidentId: string) => {
+    try {
+      const logs = await authorityService.getIncidentAuditHistory(incidentId);
+      setAuditLogs(logs || []);
+    } catch (err) {
+      console.error('Error fetching audit logs:', err);
+    }
+  };
 
   const fetchAllocations = async (incidentId: string) => {
     try {
@@ -143,6 +168,190 @@ export const AuthorityIncidents: React.FC = () => {
       console.error('Error fetching vehicle allocations:', err);
     }
   };
+
+  // 1. Fetch initial incidents list from Supabase
+  useEffect(() => {
+    fetchIncidents();
+  }, []);
+
+  // 2. Resolve target incident from ID, Code, or Report Mapping
+  useEffect(() => {
+    async function resolveTarget() {
+      if (!targetId) {
+        setTargetIncident(null);
+        setTargetNotFound(false);
+        return;
+      }
+
+      // Check loaded state first
+      const foundInList = incidents.find(
+        (i) => i.id === targetId || (i.code && i.code.toLowerCase() === targetId.toLowerCase())
+      );
+      if (foundInList) {
+        setTargetIncident(foundInList);
+        setTargetNotFound(false);
+        return;
+      }
+
+      // If not yet in list, query Supabase directly
+      setIsResolvingTarget(true);
+      try {
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetId);
+        let incData: DBIncident | null = null;
+
+        if (isUuid) {
+          const { data } = await supabase.from('incidents').select('*').eq('id', targetId).maybeSingle();
+          incData = data;
+        } else {
+          const { data } = await supabase.from('incidents').select('*').ilike('code', targetId).maybeSingle();
+          incData = data;
+        }
+
+        // If not found and is UUID, check if targetId was actually a report ID
+        if (!incData && isUuid) {
+          const { data: rep } = await supabase.from('emergency_reports').select('incident_id').eq('id', targetId).maybeSingle();
+          if (rep?.incident_id) {
+            const { data: linkedInc } = await supabase.from('incidents').select('*').eq('id', rep.incident_id).maybeSingle();
+            incData = linkedInc;
+          }
+        }
+
+        if (incData) {
+          setTargetIncident(incData);
+          setTargetNotFound(false);
+        } else {
+          setTargetIncident(null);
+          setTargetNotFound(true);
+        }
+      } catch (err) {
+        console.error('Error resolving incident target:', err);
+        setTargetNotFound(true);
+      } finally {
+        setIsResolvingTarget(false);
+      }
+    }
+
+    if (!isLoading) {
+      resolveTarget();
+    }
+  }, [targetId, incidents, isLoading]);
+
+  // Determine current active incident
+  const currentIncident: DBIncident | null = targetId
+    ? targetIncident || incidents.find((i) => i.id === targetId || (i.code && i.code.toLowerCase() === targetId.toLowerCase())) || null
+    : (incidents[0] || null);
+
+  // Track active incident via ref so realtime callbacks always read the latest incident without re-subscribing
+  const currentIncidentRef = useRef<DBIncident | null>(currentIncident);
+  useEffect(() => {
+    currentIncidentRef.current = currentIncident;
+  }, [currentIncident]);
+
+  // 3. Load dependent data when current incident changes
+  useEffect(() => {
+    if (currentIncident?.id) {
+      fetchSupportingReports(currentIncident.id);
+      fetchAuditLogs(currentIncident.id);
+      fetchAllocations(currentIncident.id);
+    }
+  }, [currentIncident?.id]);
+
+  // 4. Realtime Supabase Subscription Effect
+  // Lifecycle Requirements:
+  // - Creates dedicated channel
+  // - Registers ALL postgres_changes handlers on the channel BEFORE calling .subscribe()
+  // - Calls subscribe() exactly once after all listeners are registered
+  // - In React effect cleanup, calls supabase.removeChannel(channel)
+  // - Subscribes once on mount (empty dependency array []) to prevent duplicate subscriptions on re-renders
+  // - Wrapped in try/catch to protect page from crashing
+  useEffect(() => {
+    let channel: RealtimeChannel | null = null;
+    let isMounted = true;
+
+    try {
+      const channelName = `realtime:authority-incidents-${Date.now()}`;
+      const newChannel = supabase.channel(channelName);
+
+      const handleRealtimeEvent = (table: string, payload: any) => {
+        if (!isMounted) return;
+        console.log(`[Supabase Realtime (${table})]:`, payload);
+        setRealtimeStatus('LIVE');
+        fetchIncidents();
+        const activeId = currentIncidentRef.current?.id;
+        if (activeId) {
+          fetchAllocations(activeId);
+          fetchAuditLogs(activeId);
+          fetchSupportingReports(activeId);
+        }
+      };
+
+      // Register ALL postgres_changes handlers on the channel BEFORE calling .subscribe()
+      newChannel
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'incidents' },
+          (payload) => handleRealtimeEvent('incidents', payload)
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'vehicles' },
+          (payload) => handleRealtimeEvent('vehicles', payload)
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'incident_resources' },
+          (payload) => handleRealtimeEvent('incident_resources', payload)
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'vehicle_status_history' },
+          (payload) => handleRealtimeEvent('vehicle_status_history', payload)
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'emergency_reports' },
+          (payload) => handleRealtimeEvent('emergency_reports', payload)
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'notifications' },
+          (payload) => handleRealtimeEvent('notifications', payload)
+        );
+
+      // Call subscribe() exactly once after all listeners are registered
+      newChannel.subscribe((status, err) => {
+        if (!isMounted) return;
+        if (status === 'SUBSCRIBED') {
+          setRealtimeStatus('LIVE');
+          console.log(`[Supabase Realtime] Subscribed to ${channelName}`);
+        } else if (status === 'CLOSED') {
+          console.log(`[Supabase Realtime] Channel ${channelName} closed`);
+        } else if (status === 'CHANNEL_ERROR') {
+          console.warn(`[Supabase Realtime] Channel error on ${channelName}:`, err);
+          setRealtimeStatus('OFFLINE');
+        } else if (status === 'TIMED_OUT') {
+          console.warn(`[Supabase Realtime] Subscription timed out on ${channelName}`);
+          setRealtimeStatus('OFFLINE');
+        }
+      });
+
+      channel = newChannel;
+    } catch (realtimeErr) {
+      console.error('[Supabase Realtime Setup Error in AuthorityIncidents]:', realtimeErr);
+      if (isMounted) setRealtimeStatus('OFFLINE');
+    }
+
+    // In the React effect cleanup, call supabase.removeChannel(channel)
+    return () => {
+      isMounted = false;
+      if (channel) {
+        supabase.removeChannel(channel).catch((err) => {
+          console.warn('[Supabase Realtime Cleanup Warning]:', err);
+        });
+        channel = null;
+      }
+    };
+  }, []);
 
   const handleAllocateVehicle = async (vehicleId: string) => {
     if (!currentIncident?.id) return;
@@ -178,15 +387,6 @@ export const AuthorityIncidents: React.FC = () => {
       setError(err.message || 'Vehicle dispatch failed.');
     } finally {
       setIsDispatching(false);
-    }
-  };
-
-  const fetchAuditLogs = async (incidentId: string) => {
-    try {
-      const logs = await authorityService.getIncidentAuditHistory(incidentId);
-      setAuditLogs(logs);
-    } catch (err) {
-      console.error('Error fetching audit logs:', err);
     }
   };
 
@@ -256,47 +456,6 @@ export const AuthorityIncidents: React.FC = () => {
     }
   };
 
-  const fetchIncidents = async () => {
-    setIsLoading(true);
-    setError(null);
-    try {
-      const { data, error: fetchErr } = await supabase
-        .from('incidents')
-        .select('*')
-        .order('created_at', { ascending: false });
-
-      if (fetchErr) {
-        throw new Error(fetchErr.message);
-      }
-
-      setIncidents(data || []);
-    } catch (err: any) {
-      console.error('Error fetching incidents:', err);
-      setError(err.message || 'Could not load incidents from Supabase.');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const fetchSupportingReports = async (incidentId: string) => {
-    try {
-      const { data, error: repErr } = await supabase
-        .from('emergency_reports')
-        .select('id, report_number, emergency_type, description, location_text, people_affected, people_injured, people_trapped, created_at, ai_summary')
-        .eq('incident_id', incidentId)
-        .order('created_at', { ascending: true });
-
-      if (repErr) {
-        console.error('Error fetching supporting reports:', repErr);
-        return;
-      }
-
-      setSupportingReports(data || []);
-    } catch (err) {
-      console.error('Error in fetchSupportingReports:', err);
-    }
-  };
-
   const handleRunClustering = async () => {
     setIsClustering(true);
     setClusterNotice(null);
@@ -335,473 +494,520 @@ export const AuthorityIncidents: React.FC = () => {
     }
   };
 
-  if (isLoading) {
+  if (isLoading || isResolvingTarget) {
     return (
-      <div className="bg-white border border-slate-200 rounded-2xl p-12 text-center space-y-3">
+      <div className="bg-white border border-slate-200 rounded-2xl p-12 text-center space-y-3 shadow-sm">
         <Loader2 className="w-8 h-8 text-red-600 animate-spin mx-auto" />
-        <p className="text-xs font-semibold text-slate-600">Retrieving incidents from Supabase PostgreSQL...</p>
+        <p className="text-xs font-semibold text-slate-600">Retrieving incident record from Supabase PostgreSQL...</p>
+      </div>
+    );
+  }
+
+  // Graceful Not-Found State if targetId was specified but does not exist
+  if (targetNotFound && targetId) {
+    return (
+      <div className="bg-white border border-amber-200 rounded-2xl p-10 text-center space-y-4 shadow-sm">
+        <div className="w-14 h-14 bg-amber-100 text-amber-700 rounded-2xl flex items-center justify-center mx-auto shadow-inner">
+          <AlertCircle className="w-7 h-7" />
+        </div>
+        <div className="space-y-1.5">
+          <h2 className="text-base font-bold text-slate-900">Incident Record Not Found</h2>
+          <p className="text-xs text-slate-600 max-w-md mx-auto">
+            The requested incident reference <span className="font-mono font-bold text-slate-900 bg-slate-100 px-1.5 py-0.5 rounded">"{targetId}"</span> could not be located in Supabase PostgreSQL.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+          <button
+            type="button"
+            onClick={() => {
+              setTargetNotFound(false);
+              navigate('/authority/incidents');
+            }}
+            className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-sm transition-all"
+          >
+            View Active Incidents
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate('/authority/reports')}
+            className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition-all"
+          >
+            Back to Citizen Reports
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-bold text-slate-900">Incident Command Center</h1>
-          <p className="text-xs text-slate-600">Real-time incident clustering & priority engine from Supabase database.</p>
-        </div>
-
-        <div className="flex items-center space-x-2">
-          <button
-            type="button"
-            onClick={handleRecalculatePriorities}
-            disabled={isClustering}
-            className="bg-amber-600 hover:bg-amber-700 disabled:bg-slate-400 text-white text-xs font-bold px-3.5 py-2.5 rounded-xl shadow-sm transition-all flex items-center space-x-2"
-          >
-            <Zap className="w-4 h-4 text-white" />
-            <span>Recalculate Priorities</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={handleRunClustering}
-            disabled={isClustering}
-            className="bg-slate-900 hover:bg-slate-800 disabled:bg-slate-400 text-white text-xs font-bold px-4 py-2.5 rounded-xl shadow-sm transition-all flex items-center space-x-2"
-          >
-            {isClustering ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin text-white" />
-                <span>Processing...</span>
-              </>
-            ) : (
-              <>
-                <Layers className="w-4 h-4 text-red-500" />
-                <span>Run Incident Clustering</span>
-              </>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {clusterNotice && (
-        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 flex items-center space-x-2 text-xs text-emerald-800 font-medium">
-          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-          <span>{clusterNotice}</span>
-        </div>
-      )}
-
-      {error && (
-        <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-start space-x-3 text-red-800 text-xs">
-          <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-          <div className="space-y-0.5">
-            <span className="font-bold">Command Error</span>
-            <p>{error}</p>
+    <ErrorBoundary fallbackTitle="Incident Workspace Error">
+      <div className="space-y-6">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h1 className="text-xl font-bold text-slate-900">Incident Command Center</h1>
+            <p className="text-xs text-slate-600">Real-time incident clustering & priority engine from Supabase database.</p>
           </div>
-        </div>
-      )}
 
-      {!currentIncident ? (
-        <div className="bg-white border border-slate-200 rounded-2xl p-12 text-center space-y-3">
-          <AlertTriangle className="w-10 h-10 text-slate-400 mx-auto" />
-          <p className="text-sm font-semibold text-slate-700">No active incidents found in database.</p>
-          <p className="text-xs text-slate-500">Click "Run Incident Clustering" above to group unlinked emergency reports into incidents.</p>
-        </div>
-      ) : (
-        <div className="space-y-6">
-          <div className="bg-slate-900 text-white rounded-2xl p-5 shadow-md flex flex-wrap items-center justify-between gap-4">
-            <div>
-              <div className="flex items-center space-x-3">
-                <span className="font-mono font-black text-xl text-red-500">{currentIncident.code}</span>
-                <span
-                  className={`px-3 py-0.5 text-xs font-bold rounded uppercase ${
-                    currentIncident.priority === 'critical' ? 'bg-red-600 text-white' : 'bg-amber-500 text-white'
-                  }`}
-                >
-                  {currentIncident.priority} Priority
-                </span>
-                <span className="px-3 py-0.5 text-xs font-semibold rounded bg-slate-800 text-slate-300 uppercase">
-                  STATUS: {currentIncident.status}
-                </span>
-              </div>
-              <h2 className="text-xl font-bold pt-1">{currentIncident.title}</h2>
-              <p className="text-xs text-slate-400">{currentIncident.location_text}</p>
-            </div>
+          <div className="flex items-center space-x-2">
+            <button
+              type="button"
+              onClick={handleRecalculatePriorities}
+              disabled={isClustering}
+              className="bg-amber-600 hover:bg-amber-700 disabled:bg-slate-400 text-white text-xs font-bold px-3.5 py-2.5 rounded-xl shadow-sm transition-all flex items-center space-x-2"
+            >
+              <Zap className="w-4 h-4 text-white" />
+              <span>Recalculate Priorities</span>
+            </button>
 
             <button
               type="button"
-              onClick={fetchIncidents}
-              className="bg-slate-800 hover:bg-slate-700 text-slate-300 p-2.5 rounded-xl border border-slate-700 transition-colors"
-              title="Refresh Incidents"
+              onClick={handleRunClustering}
+              disabled={isClustering}
+              className="bg-slate-900 hover:bg-slate-800 disabled:bg-slate-400 text-white text-xs font-bold px-4 py-2.5 rounded-xl shadow-sm transition-all flex items-center space-x-2"
             >
-              <RefreshCw className="w-4 h-4" />
+              {isClustering ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin text-white" />
+                  <span>Processing...</span>
+                </>
+              ) : (
+                <>
+                  <Layers className="w-4 h-4 text-red-500" />
+                  <span>Run Incident Clustering</span>
+                </>
+              )}
             </button>
           </div>
+        </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 space-y-6">
-              <div className="flex border-b border-slate-200 space-x-4">
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('overview')}
-                  className={`pb-2.5 text-xs font-bold transition-colors ${
-                    activeTab === 'overview' ? 'border-b-2 border-red-600 text-red-600' : 'text-slate-500 hover:text-slate-900'
-                  }`}
-                >
-                  Overview & Supporting Reports ({supportingReports.length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('clustering')}
-                  className={`pb-2.5 text-xs font-bold transition-colors ${
-                    activeTab === 'clustering' ? 'border-b-2 border-red-600 text-red-600' : 'text-slate-500 hover:text-slate-900'
-                  }`}
-                >
-                  Clustering & AI Rationale
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('verification')}
-                  className={`pb-2.5 text-xs font-bold transition-colors ${
-                    activeTab === 'verification' ? 'border-b-2 border-red-600 text-red-600' : 'text-slate-500 hover:text-slate-900'
-                  }`}
-                >
-                  Authority Audit ({auditLogs.length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('allocation')}
-                  className={`pb-2.5 text-xs font-bold transition-colors flex items-center space-x-1 ${
-                    activeTab === 'allocation' ? 'border-b-2 border-red-600 text-red-600' : 'text-slate-500 hover:text-slate-900'
-                  }`}
-                >
-                  <Truck className="w-3.5 h-3.5" />
-                  <span>Resource Allocation (Phase 3F)</span>
-                </button>
+        {clusterNotice && (
+          <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 flex items-center space-x-2 text-xs text-emerald-800 font-medium">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>{clusterNotice}</span>
+          </div>
+        )}
+
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-start space-x-3 text-red-800 text-xs">
+            <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <span className="font-bold">Command Error</span>
+              <p>{error}</p>
+            </div>
+          </div>
+        )}
+
+        {!currentIncident ? (
+          <div className="bg-white border border-slate-200 rounded-2xl p-12 text-center space-y-3 shadow-sm">
+            <AlertTriangle className="w-10 h-10 text-slate-400 mx-auto" />
+            <p className="text-sm font-semibold text-slate-700">No active incidents found in database.</p>
+            <p className="text-xs text-slate-500">Click "Run Incident Clustering" above to group unlinked emergency reports into incidents.</p>
+          </div>
+        ) : (
+          <div className="space-y-6">
+            <div className="bg-slate-900 text-white rounded-2xl p-5 shadow-md flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <div className="flex items-center space-x-3">
+                  <span className="font-mono font-black text-xl text-red-500">{currentIncident.code || 'INCIDENT'}</span>
+                  <span
+                    className={`px-3 py-0.5 text-xs font-bold rounded uppercase ${
+                      currentIncident.priority === 'critical' ? 'bg-red-600 text-white' : 'bg-amber-500 text-white'
+                    }`}
+                  >
+                    {String(currentIncident.priority || 'medium')} Priority
+                  </span>
+                  <span className="px-3 py-0.5 text-xs font-semibold rounded bg-slate-800 text-slate-300 uppercase">
+                    STATUS: {String(currentIncident.status || 'open')}
+                  </span>
+                </div>
+                <h2 className="text-xl font-bold pt-1">{currentIncident.title || 'Untitled Incident'}</h2>
+                <p className="text-xs text-slate-400">{currentIncident.location_text || 'Location unavailable'}</p>
               </div>
 
-              {activeTab === 'overview' && (
-                <div className="space-y-6">
-                  {/* Authority Verification & Human-in-the-Loop Card */}
+              <button
+                type="button"
+                onClick={fetchIncidents}
+                className="bg-slate-800 hover:bg-slate-700 text-slate-300 p-2.5 rounded-xl border border-slate-700 transition-colors"
+                title="Refresh Incidents"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-2 space-y-6">
+                <div className="flex border-b border-slate-200 space-x-4">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('overview')}
+                    className={`pb-2.5 text-xs font-bold transition-colors ${
+                      activeTab === 'overview' ? 'border-b-2 border-red-600 text-red-600' : 'text-slate-500 hover:text-slate-900'
+                    }`}
+                  >
+                    Overview & Supporting Reports ({supportingReports.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('clustering')}
+                    className={`pb-2.5 text-xs font-bold transition-colors ${
+                      activeTab === 'clustering' ? 'border-b-2 border-red-600 text-red-600' : 'text-slate-500 hover:text-slate-900'
+                    }`}
+                  >
+                    Clustering & AI Rationale
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('verification')}
+                    className={`pb-2.5 text-xs font-bold transition-colors ${
+                      activeTab === 'verification' ? 'border-b-2 border-red-600 text-red-600' : 'text-slate-500 hover:text-slate-900'
+                    }`}
+                  >
+                    Authority Audit ({auditLogs.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('allocation')}
+                    className={`pb-2.5 text-xs font-bold transition-colors flex items-center space-x-1 ${
+                      activeTab === 'allocation' ? 'border-b-2 border-red-600 text-red-600' : 'text-slate-500 hover:text-slate-900'
+                    }`}
+                  >
+                    <Truck className="w-3.5 h-3.5" />
+                    <span>Resource Allocation (Phase 3F)</span>
+                  </button>
+                </div>
+
+                {activeTab === 'overview' && (
+                  <div className="space-y-6">
+                    {/* Authority Verification & Human-in-the-Loop Card */}
+                    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-2">
+                          <ShieldCheck className="w-5 h-5 text-indigo-600" />
+                          <h3 className="text-sm font-bold text-slate-900">Authority Verification & Human-in-the-Loop</h3>
+                        </div>
+                        <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${
+                          currentIncident.verification_status === 'approved' ? 'bg-emerald-100 text-emerald-800' :
+                          currentIncident.verification_status === 'modified' ? 'bg-blue-100 text-blue-800' :
+                          currentIncident.verification_status === 'rejected' ? 'bg-red-100 text-red-800' : 'bg-amber-100 text-amber-800'
+                        }`}>
+                          Verification: {currentIncident.verification_status || 'pending_review'}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+                        <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-1">
+                          <span className="font-semibold text-slate-500 block">System Recommended Priority</span>
+                          <span className="font-mono font-bold text-slate-900 text-sm uppercase">
+                            {currentIncident.system_priority || currentIncident.priority || 'medium'}
+                          </span>
+                        </div>
+                        <div className="bg-indigo-50 p-3.5 rounded-xl border border-indigo-200 space-y-1">
+                          <span className="font-semibold text-indigo-700 block">Authority Verified Operational Priority</span>
+                          <span className="font-mono font-bold text-indigo-950 text-sm uppercase">
+                            {currentIncident.priority || 'medium'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {currentIncident.authority_notes && (
+                        <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs text-slate-700 space-y-1">
+                          <span className="font-bold text-slate-900 block">Authority Note:</span>
+                          <p>{currentIncident.authority_notes}</p>
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100">
+                        <button
+                          type="button"
+                          onClick={handleApprove}
+                          disabled={isVerifying}
+                          className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-400 text-white text-xs font-bold px-3.5 py-2 rounded-xl flex items-center space-x-1.5 transition-all"
+                        >
+                          <Check className="w-4 h-4" />
+                          <span>APPROVE RECOMMENDATION</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => { setShowModifyModal(true); setShowRejectModal(false); setError(null); }}
+                          disabled={isVerifying}
+                          className="bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white text-xs font-bold px-3.5 py-2 rounded-xl flex items-center space-x-1.5 transition-all"
+                        >
+                          <Edit3 className="w-4 h-4" />
+                          <span>MODIFY PRIORITY</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => { setShowRejectModal(true); setShowModifyModal(false); setError(null); }}
+                          disabled={isVerifying}
+                          className="bg-red-600 hover:bg-red-700 disabled:bg-slate-400 text-white text-xs font-bold px-3.5 py-2 rounded-xl flex items-center space-x-1.5 transition-all"
+                        >
+                          <XCircle className="w-4 h-4" />
+                          <span>REJECT</span>
+                        </button>
+                      </div>
+
+                      {showModifyModal && (
+                        <div className="bg-blue-50 border border-blue-200 p-4 rounded-xl space-y-3 text-xs">
+                          <span className="font-bold text-blue-900 block">Modify Incident Operational Priority</span>
+                          <div className="flex items-center space-x-3">
+                            <label className="font-semibold text-slate-700">New Operational Priority:</label>
+                            <select
+                              value={selectedModifyPriority}
+                              onChange={(e) => setSelectedModifyPriority(e.target.value as PriorityLevel)}
+                              className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-bold"
+                            >
+                              <option value="critical">CRITICAL</option>
+                              <option value="high">HIGH</option>
+                              <option value="medium">MEDIUM</option>
+                              <option value="low">LOW</option>
+                            </select>
+                          </div>
+                          <textarea
+                            placeholder="Mandatory justification reason for priority modification..."
+                            value={authorityReasonInput}
+                            onChange={(e) => setAuthorityReasonInput(e.target.value)}
+                            className="w-full bg-white border border-slate-300 rounded-lg p-2.5 text-xs font-medium"
+                            rows={2}
+                          />
+                          <div className="flex space-x-2">
+                            <button
+                              type="button"
+                              onClick={handleModifySubmit}
+                              disabled={isVerifying}
+                              className="bg-blue-700 text-white font-bold px-3 py-1.5 rounded-lg"
+                            >
+                              Submit Modification
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setShowModifyModal(false)}
+                              className="bg-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {showRejectModal && (
+                        <div className="bg-red-50 border border-red-200 p-4 rounded-xl space-y-3 text-xs">
+                          <span className="font-bold text-red-900 block">Reject Recommendation / Incident Assessment</span>
+                          <textarea
+                            placeholder="Mandatory rejection reason (e.g. false report, duplicate, resolved)..."
+                            value={authorityReasonInput}
+                            onChange={(e) => setAuthorityReasonInput(e.target.value)}
+                            className="w-full bg-white border border-slate-300 rounded-lg p-2.5 text-xs font-medium"
+                            rows={2}
+                          />
+                          <div className="flex space-x-2">
+                            <button
+                              type="button"
+                              onClick={handleRejectSubmit}
+                              disabled={isVerifying}
+                              className="bg-red-700 text-white font-bold px-3 py-1.5 rounded-lg"
+                            >
+                              Confirm Rejection
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setShowRejectModal(false)}
+                              className="bg-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
+                      <h3 className="text-sm font-bold text-slate-900 flex items-center space-x-2">
+                        <AlertTriangle className="w-4 h-4 text-red-600" />
+                        <span>Incident Description & Aggregated Impact</span>
+                      </h3>
+                      <p className="text-sm text-slate-700 bg-slate-50 p-4 rounded-xl border border-slate-200 font-medium">
+                        {currentIncident.description || 'No description provided.'}
+                      </p>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
+                          <span className="text-xs text-slate-500 block">Affected</span>
+                          <span className="text-lg font-black text-slate-900">{currentIncident.affected_count || 0}</span>
+                        </div>
+                        <div className="bg-red-50 p-3 rounded-xl border border-red-200">
+                          <span className="text-xs text-red-700 block">Trapped</span>
+                          <span className="text-lg font-black text-red-700">{currentIncident.trapped_count || 0}</span>
+                        </div>
+                        <div className="bg-amber-50 p-3 rounded-xl border border-amber-200">
+                          <span className="text-xs text-amber-800 block">Injured</span>
+                          <span className="text-lg font-black text-amber-800">{currentIncident.injured_count || 0}</span>
+                        </div>
+                        <div className="bg-purple-50 p-3 rounded-xl border border-purple-200">
+                          <span className="text-xs text-purple-800 block">Vulnerable</span>
+                          <span className="text-lg font-black text-purple-900">{currentIncident.vulnerable_count || 0}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-3">
+                      <h3 className="text-sm font-bold text-slate-900">Grouped Citizen Reports ({supportingReports.length})</h3>
+                      {supportingReports.length === 0 ? (
+                        <p className="text-xs text-slate-500 italic">No linked citizen reports found for this incident ID.</p>
+                      ) : (
+                        <div className="space-y-2.5">
+                          {supportingReports.map((rep) => (
+                            <div key={rep.id} className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-1 text-xs">
+                              <div className="flex items-center justify-between">
+                                <span className="font-mono font-bold text-slate-900">{rep.report_number || rep.id.slice(0, 8)}</span>
+                                <span className="text-[10px] text-slate-500 flex items-center space-x-1">
+                                  <Clock className="w-3 h-3" />
+                                  <span>{rep.created_at ? new Date(rep.created_at).toLocaleTimeString() : 'N/A'}</span>
+                                </span>
+                              </div>
+                              <p className="text-slate-800 font-medium">{rep.ai_summary || rep.description}</p>
+                              <div className="flex items-center space-x-2 text-[10px] text-slate-500 pt-1">
+                                <MapPin className="w-3 h-3 text-red-600" />
+                                <span>{rep.location_text || 'Location unavailable'}</span>
+                                <span>• Affected: {rep.people_affected || 0}</span>
+                                <span>• Injured: {rep.people_injured || 0}</span>
+                                <span>• Trapped: {rep.people_trapped || 0}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-2">
+                      <span className="text-xs font-bold text-slate-900 block">Incident Location Map</span>
+                      <ModularMap
+                        center={{
+                          latitude: Number(currentIncident.latitude) || 13.0827,
+                          longitude: Number(currentIncident.longitude) || 80.2707,
+                          address: currentIncident.location_text || 'Incident Location',
+                        }}
+                        zoom={14}
+                        selectedLocationPin={{
+                          latitude: Number(currentIncident.latitude) || 13.0827,
+                          longitude: Number(currentIncident.longitude) || 80.2707,
+                          address: currentIncident.location_text || 'Incident Location',
+                        }}
+                        height="280px"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {activeTab === 'clustering' && (
                   <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center space-x-2">
-                        <ShieldCheck className="w-5 h-5 text-indigo-600" />
-                        <h3 className="text-sm font-bold text-slate-900">Authority Verification & Human-in-the-Loop</h3>
-                      </div>
-                      <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${
-                        currentIncident.verification_status === 'approved' ? 'bg-emerald-100 text-emerald-800' :
-                        currentIncident.verification_status === 'modified' ? 'bg-blue-100 text-blue-800' :
-                        currentIncident.verification_status === 'rejected' ? 'bg-red-100 text-red-800' : 'bg-amber-100 text-amber-800'
-                      }`}>
-                        Verification: {currentIncident.verification_status || 'pending_review'}
-                      </span>
+                    <div className="flex items-center space-x-2">
+                      <Bot className="w-5 h-5 text-red-600" />
+                      <h3 className="text-sm font-bold text-slate-900">Explainable AI Rationale & Clustering Rules</h3>
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-                      <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-1">
-                        <span className="font-semibold text-slate-500 block">System Recommended Priority</span>
-                        <span className="font-mono font-bold text-slate-900 text-sm uppercase">
-                          {currentIncident.system_priority || currentIncident.priority}
-                        </span>
-                      </div>
-                      <div className="bg-indigo-50 p-3.5 rounded-xl border border-indigo-200 space-y-1">
-                        <span className="font-semibold text-indigo-700 block">Authority Verified Operational Priority</span>
-                        <span className="font-mono font-bold text-indigo-950 text-sm uppercase">
-                          {currentIncident.priority}
-                        </span>
-                      </div>
+                    <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2 text-xs">
+                      <span className="font-bold text-slate-900 block">Geospatial & Signal Rationale</span>
+                      <p className="text-slate-700 font-mono bg-white p-2.5 rounded border border-slate-200">
+                        {currentIncident.clustering_reason || 'Geospatial radius & time proximity clustering.'}
+                      </p>
                     </div>
 
-                    {currentIncident.authority_notes && (
-                      <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs text-slate-700 space-y-1">
-                        <span className="font-bold text-slate-900 block">Authority Note:</span>
-                        <p>{currentIncident.authority_notes}</p>
-                      </div>
-                    )}
-
-                    <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100">
-                      <button
-                        type="button"
-                        onClick={handleApprove}
-                        disabled={isVerifying}
-                        className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-400 text-white text-xs font-bold px-3.5 py-2 rounded-xl flex items-center space-x-1.5 transition-all"
-                      >
-                        <Check className="w-4 h-4" />
-                        <span>APPROVE RECOMMENDATION</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => { setShowModifyModal(true); setShowRejectModal(false); setError(null); }}
-                        disabled={isVerifying}
-                        className="bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white text-xs font-bold px-3.5 py-2 rounded-xl flex items-center space-x-1.5 transition-all"
-                      >
-                        <Edit3 className="w-4 h-4" />
-                        <span>MODIFY PRIORITY</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => { setShowRejectModal(true); setShowModifyModal(false); setError(null); }}
-                        disabled={isVerifying}
-                        className="bg-red-600 hover:bg-red-700 disabled:bg-slate-400 text-white text-xs font-bold px-3.5 py-2 rounded-xl flex items-center space-x-1.5 transition-all"
-                      >
-                        <XCircle className="w-4 h-4" />
-                        <span>REJECT</span>
-                      </button>
-                    </div>
-
-                    {showModifyModal && (
-                      <div className="bg-blue-50 border border-blue-200 p-4 rounded-xl space-y-3 text-xs">
-                        <span className="font-bold text-blue-900 block">Modify Incident Operational Priority</span>
-                        <div className="flex items-center space-x-3">
-                          <label className="font-semibold text-slate-700">New Operational Priority:</label>
-                          <select
-                            value={selectedModifyPriority}
-                            onChange={(e) => setSelectedModifyPriority(e.target.value as PriorityLevel)}
-                            className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-bold"
-                          >
-                            <option value="critical">CRITICAL</option>
-                            <option value="high">HIGH</option>
-                            <option value="medium">MEDIUM</option>
-                            <option value="low">LOW</option>
-                          </select>
-                        </div>
-                        <textarea
-                          placeholder="Mandatory justification reason for priority modification..."
-                          value={authorityReasonInput}
-                          onChange={(e) => setAuthorityReasonInput(e.target.value)}
-                          className="w-full bg-white border border-slate-300 rounded-lg p-2.5 text-xs font-medium"
-                          rows={2}
-                        />
-                        <div className="flex space-x-2">
-                          <button
-                            type="button"
-                            onClick={handleModifySubmit}
-                            disabled={isVerifying}
-                            className="bg-blue-700 text-white font-bold px-3 py-1.5 rounded-lg"
-                          >
-                            Submit Modification
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setShowModifyModal(false)}
-                            className="bg-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    {showRejectModal && (
-                      <div className="bg-red-50 border border-red-200 p-4 rounded-xl space-y-3 text-xs">
-                        <span className="font-bold text-red-900 block">Reject Recommendation / Incident Assessment</span>
-                        <textarea
-                          placeholder="Mandatory rejection reason (e.g. false report, duplicate, resolved)..."
-                          value={authorityReasonInput}
-                          onChange={(e) => setAuthorityReasonInput(e.target.value)}
-                          className="w-full bg-white border border-slate-300 rounded-lg p-2.5 text-xs font-medium"
-                          rows={2}
-                        />
-                        <div className="flex space-x-2">
-                          <button
-                            type="button"
-                            onClick={handleRejectSubmit}
-                            disabled={isVerifying}
-                            className="bg-red-700 text-white font-bold px-3 py-1.5 rounded-lg"
-                          >
-                            Confirm Rejection
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setShowRejectModal(false)}
-                            className="bg-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg"
-                          >
-                            Cancel
-                          </button>
-                        </div>
+                    {Array.isArray(currentIncident.priority_reasons) && currentIncident.priority_reasons.length > 0 && (
+                      <div className="space-y-2">
+                        <span className="text-xs font-bold text-slate-900 block">Priority Reasons</span>
+                        <ul className="space-y-2">
+                          {currentIncident.priority_reasons.map((reason, idx) => (
+                            <li key={idx} className="flex items-start space-x-2 bg-red-50 border border-red-200 p-3 rounded-xl text-xs text-red-800 font-semibold">
+                              <Zap className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                              <span>{reason}</span>
+                            </li>
+                          ))}
+                        </ul>
                       </div>
                     )}
                   </div>
+                )}
+
+                {activeTab === 'verification' && (
                   <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-                    <h3 className="text-sm font-bold text-slate-900 flex items-center space-x-2">
-                      <AlertTriangle className="w-4 h-4 text-red-600" />
-                      <span>Incident Description & Aggregated Impact</span>
-                    </h3>
-                    <p className="text-sm text-slate-700 bg-slate-50 p-4 rounded-xl border border-slate-200 font-medium">
-                      {currentIncident.description}
-                    </p>
-
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                      <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                        <span className="text-xs text-slate-500 block">Affected</span>
-                        <span className="text-lg font-black text-slate-900">{currentIncident.affected_count}</span>
-                      </div>
-                      <div className="bg-red-50 p-3 rounded-xl border border-red-200">
-                        <span className="text-xs text-red-700 block">Trapped</span>
-                        <span className="text-lg font-black text-red-700">{currentIncident.trapped_count}</span>
-                      </div>
-                      <div className="bg-amber-50 p-3 rounded-xl border border-amber-200">
-                        <span className="text-xs text-amber-800 block">Injured</span>
-                        <span className="text-lg font-black text-amber-800">{currentIncident.injured_count}</span>
-                      </div>
-                      <div className="bg-purple-50 p-3 rounded-xl border border-purple-200">
-                        <span className="text-xs text-purple-800 block">Vulnerable</span>
-                        <span className="text-lg font-black text-purple-900">{currentIncident.vulnerable_count}</span>
-                      </div>
+                    <div className="flex items-center space-x-2">
+                      <History className="w-5 h-5 text-indigo-600" />
+                      <h3 className="text-sm font-bold text-slate-900">Immutable Audit History (`public.audit_logs`)</h3>
                     </div>
-                  </div>
 
-                  <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-3">
-                    <h3 className="text-sm font-bold text-slate-900">Grouped Citizen Reports ({supportingReports.length})</h3>
-                    {supportingReports.length === 0 ? (
-                      <p className="text-xs text-slate-500 italic">No linked citizen reports found for this incident ID.</p>
+                    {auditLogs.length === 0 ? (
+                      <p className="text-xs text-slate-500 italic p-4 bg-slate-50 rounded-xl border border-slate-200">
+                        No authority verification audit records recorded yet for this incident.
+                      </p>
                     ) : (
-                      <div className="space-y-2.5">
-                        {supportingReports.map((rep) => (
-                          <div key={rep.id} className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-1 text-xs">
+                      <div className="space-y-3">
+                        {auditLogs.map((log) => (
+                          <div key={log.id} className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-xs space-y-1.5 font-mono">
                             <div className="flex items-center justify-between">
-                              <span className="font-mono font-bold text-slate-900">{rep.report_number || rep.id.slice(0, 8)}</span>
-                              <span className="text-[10px] text-slate-500 flex items-center space-x-1">
-                                <Clock className="w-3 h-3" />
-                                <span>{new Date(rep.created_at).toLocaleTimeString()}</span>
+                              <span className="font-bold text-indigo-950 uppercase">{log.action}</span>
+                              <span className="text-[10px] text-slate-500">
+                                {log.created_at ? new Date(log.created_at).toLocaleString() : 'N/A'}
                               </span>
                             </div>
-                            <p className="text-slate-800 font-medium">{rep.ai_summary || rep.description}</p>
-                            <div className="flex items-center space-x-2 text-[10px] text-slate-500 pt-1">
-                              <MapPin className="w-3 h-3 text-red-600" />
-                              <span>{rep.location_text}</span>
-                              <span>• Affected: {rep.people_affected}</span>
-                              <span>• Injured: {rep.people_injured}</span>
-                              <span>• Trapped: {rep.people_trapped}</span>
+                            <p className="text-slate-700 text-[11px]">Actor Role: <span className="font-bold text-slate-900">{log.user_role}</span> | User ID: {log.user_id}</p>
+                            <div className="bg-white p-2 rounded border border-slate-200 text-[10px] text-slate-800 font-mono">
+                              {JSON.stringify(log.details, null, 2)}
                             </div>
                           </div>
                         ))}
                       </div>
                     )}
                   </div>
+                )}
 
-                  <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-2">
-                    <span className="text-xs font-bold text-slate-900 block">Incident Location Map</span>
-                    <ModularMap
-                      center={{ latitude: currentIncident.latitude, longitude: currentIncident.longitude, address: currentIncident.location_text }}
-                      zoom={14}
-                      selectedLocationPin={{ latitude: currentIncident.latitude, longitude: currentIncident.longitude, address: currentIncident.location_text }}
-                      height="280px"
-                    />
-                  </div>
-                </div>
-              )}
-
-              {activeTab === 'clustering' && (
-                <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-                  <div className="flex items-center space-x-2">
-                    <Bot className="w-5 h-5 text-red-600" />
-                    <h3 className="text-sm font-bold text-slate-900">Explainable AI Rationale & Clustering Rules</h3>
-                  </div>
-
-                  <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2 text-xs">
-                    <span className="font-bold text-slate-900 block">Geospatial & Signal Rationale</span>
-                    <p className="text-slate-700 font-mono bg-white p-2.5 rounded border border-slate-200">
-                      {currentIncident.clustering_reason || 'Geospatial radius & time proximity clustering.'}
-                    </p>
-                  </div>
-
-                  {currentIncident.priority_reasons && currentIncident.priority_reasons.length > 0 && (
-                    <div className="space-y-2">
-                      <span className="text-xs font-bold text-slate-900 block">Priority Reasons</span>
-                      <ul className="space-y-2">
-                        {currentIncident.priority_reasons.map((reason, idx) => (
-                          <li key={idx} className="flex items-start space-x-2 bg-red-50 border border-red-200 p-3 rounded-xl text-xs text-red-800 font-semibold">
-                            <Zap className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                            <span>{reason}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {activeTab === 'verification' && (
-                <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-                  <div className="flex items-center space-x-2">
-                    <History className="w-5 h-5 text-indigo-600" />
-                    <h3 className="text-sm font-bold text-slate-900">Immutable Audit History (`public.audit_logs`)</h3>
-                  </div>
-
-                  {auditLogs.length === 0 ? (
-                    <p className="text-xs text-slate-500 italic p-4 bg-slate-50 rounded-xl border border-slate-200">
-                      No authority verification audit records recorded yet for this incident.
-                    </p>
-                  ) : (
-                    <div className="space-y-3">
-                      {auditLogs.map((log) => (
-                        <div key={log.id} className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-xs space-y-1.5 font-mono">
-                          <div className="flex items-center justify-between">
-                            <span className="font-bold text-indigo-950 uppercase">{log.action}</span>
-                            <span className="text-[10px] text-slate-500">{new Date(log.created_at).toLocaleString()}</span>
-                          </div>
-                          <p className="text-slate-700 text-[11px]">Actor Role: <span className="font-bold text-slate-900">{log.user_role}</span> | User ID: {log.user_id}</p>
-                          <div className="bg-white p-2 rounded border border-slate-200 text-[10px] text-slate-800 font-mono">
-                            {JSON.stringify(log.details, null, 2)}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {activeTab === 'allocation' && (
-                <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-5">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center space-x-2">
-                      <Truck className="w-5 h-5 text-red-600" />
-                      <h3 className="text-sm font-bold text-slate-900">Vehicle Allocation & Dispatch Engine (Phase 3G)</h3>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <div className="flex items-center space-x-1.5 bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-bold px-3 py-1 rounded-full">
-                        <Radio className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
-                        <span>Realtime: {realtimeStatus}</span>
+                {activeTab === 'allocation' && (
+                  <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-5">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center space-x-2">
+                        <Truck className="w-5 h-5 text-red-600" />
+                        <h3 className="text-sm font-bold text-slate-900">Vehicle Allocation & Dispatch Engine (Phase 3G)</h3>
                       </div>
-                      <span className="text-xs font-semibold bg-red-50 text-red-700 px-3 py-1 rounded-full border border-red-200">
-                        Operational Priority: {currentIncident.priority.toUpperCase()}
-                      </span>
+                      <div className="flex items-center space-x-2">
+                        <div className="flex items-center space-x-1.5 bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-bold px-3 py-1 rounded-full">
+                          <Radio className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
+                          <span>Realtime: {realtimeStatus}</span>
+                        </div>
+                        <span className="text-xs font-semibold bg-red-50 text-red-700 px-3 py-1 rounded-full border border-red-200">
+                          Operational Priority: {String(currentIncident.priority || 'medium').toUpperCase()}
+                        </span>
+                      </div>
                     </div>
-                  </div>
 
-                  {!allocationSummary ? (
-                    <div className="flex items-center space-x-2 text-xs text-slate-500 italic p-4">
-                      <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
-                      <span>Calculating vehicle suitability recommendations...</span>
-                    </div>
-                  ) : (
-                    <div className="space-y-4">
-                      {allocationSummary.recommendations.map((rec, idx) => (
-                        <div key={idx} className="border border-slate-200 rounded-xl p-4 bg-slate-50/50 space-y-3">
-                          <div className="flex items-center justify-between">
-                            <span className="font-bold text-xs text-slate-900 uppercase tracking-wider flex items-center space-x-1.5">
-                              <span className="w-2 h-2 rounded-full bg-red-600"></span>
-                              <span>Required Capability: {rec.capability.replace('_', ' ')}</span>
-                            </span>
-                            <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded uppercase ${
-                              rec.status === 'recommended' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
-                            }`}>
-                              {rec.status.replace('_', ' ')}
-                            </span>
-                          </div>
-
-                          {rec.status === 'no_suitable_resource' ? (
-                            <div className="bg-red-50 border border-red-200 p-3 rounded-lg text-xs text-red-800 flex items-start space-x-2 font-medium">
-                              <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                              <span>{rec.message}</span>
+                    {!allocationSummary ? (
+                      <div className="flex items-center space-x-2 text-xs text-slate-500 italic p-4">
+                        <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
+                        <span>Calculating vehicle suitability recommendations...</span>
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        {(allocationSummary.recommendations || []).map((rec, idx) => (
+                          <div key={idx} className="border border-slate-200 rounded-xl p-4 bg-slate-50/50 space-y-3">
+                            <div className="flex items-center justify-between">
+                              <span className="font-bold text-xs text-slate-900 uppercase tracking-wider flex items-center space-x-1.5">
+                                <span className="w-2 h-2 rounded-full bg-red-600"></span>
+                                <span>Required Capability: {String(rec.capability || '').replace('_', ' ')}</span>
+                              </span>
+                              <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded uppercase ${
+                                rec.status === 'recommended' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                              }`}>
+                                {String(rec.status || '').replace('_', ' ')}
+                              </span>
                             </div>
-                          ) : rec.vehicle ? (
-                            <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
-                              <div className="flex items-start justify-between">
+
+                            {rec.status === 'no_suitable_resource' ? (
+                              <div className="bg-red-50 border border-red-200 p-3 rounded-lg text-xs text-red-800 flex items-start space-x-2 font-medium">
+                                <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                                <span>{rec.message}</span>
+                              </div>
+                            ) : rec.vehicle ? (
+                              <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+                                <div className="flex items-start justify-between">
                                 <div>
                                   <div className="flex items-center space-x-2">
                                     <span className="font-mono font-black text-slate-900 text-sm">{rec.vehicle.vehicle_code}</span>
@@ -812,7 +1018,7 @@ export const AuthorityIncidents: React.FC = () => {
                                       rec.vehicle.status === 'en_route' ? 'bg-emerald-600 text-white' :
                                       rec.vehicle.status === 'assigned' ? 'bg-indigo-600 text-white' : 'bg-slate-200 text-slate-800'
                                     }`}>
-                                      Status: {rec.vehicle.status.replace('_', ' ')}
+                                      Status: {String(rec.vehicle.status || '').replace('_', ' ')}
                                     </span>
                                   </div>
                                   <h4 className="font-bold text-slate-900 text-sm">{rec.vehicle.name}</h4>
@@ -856,7 +1062,7 @@ export const AuthorityIncidents: React.FC = () => {
                               <div className="space-y-1">
                                 <span className="text-[10px] font-bold text-slate-600 block">Suitability Rationale:</span>
                                 <div className="flex flex-wrap gap-1">
-                                  {rec.vehicle.match_reasons.map((reason, rIdx) => (
+                                  {(rec.vehicle.match_reasons || []).map((reason, rIdx) => (
                                     <span key={rIdx} className="bg-slate-100 text-slate-700 text-[10px] font-semibold px-2 py-0.5 rounded">
                                       {reason}
                                     </span>
@@ -880,12 +1086,15 @@ export const AuthorityIncidents: React.FC = () => {
               </div>
               <div className="space-y-2 max-h-[600px] overflow-y-auto pr-1">
                 {incidents.map((inc) => {
-                  const active = inc.id === currentIncident.id;
+                  const active = currentIncident && inc.id === currentIncident.id;
                   return (
                     <button
                       key={inc.id}
                       type="button"
-                      onClick={() => setSearchParams({ id: inc.id })}
+                      onClick={() => {
+                        setTargetNotFound(false);
+                        navigate(`/authority/incidents?id=${inc.id}`);
+                      }}
                       className={`w-full text-left p-3 rounded-xl border text-xs transition-all ${
                         active
                           ? 'bg-red-600 text-white border-red-600 font-bold shadow-md'
@@ -893,11 +1102,11 @@ export const AuthorityIncidents: React.FC = () => {
                       }`}
                     >
                       <div className="flex items-center justify-between">
-                        <span className="font-mono">{inc.code}</span>
-                        <span className="uppercase text-[10px] px-1.5 py-0.5 rounded bg-black/20 font-bold">{inc.priority}</span>
+                        <span className="font-mono">{inc.code || 'INCIDENT'}</span>
+                        <span className="uppercase text-[10px] px-1.5 py-0.5 rounded bg-black/20 font-bold">{inc.priority || 'medium'}</span>
                       </div>
-                      <p className="truncate mt-1 font-semibold">{inc.title}</p>
-                      <p className="text-[10px] opacity-80 truncate">{inc.location_text}</p>
+                      <p className="truncate mt-1 font-semibold">{inc.title || 'Untitled'}</p>
+                      <p className="text-[10px] opacity-80 truncate">{inc.location_text || 'No location'}</p>
                     </button>
                   );
                 })}
@@ -906,6 +1115,7 @@ export const AuthorityIncidents: React.FC = () => {
           </div>
         </div>
       )}
-    </div>
+      </div>
+    </ErrorBoundary>
   );
 };

@@ -289,7 +289,7 @@ BEGIN
   INSERT INTO public.profiles (id, email, full_name, preferred_language, role)
   VALUES (
     NEW.id,
-    NEW.email,
+    COALESCE(NEW.email, ''),
     COALESCE(NEW.raw_user_meta_data->>'full_name', 'Citizen User'),
     COALESCE(NEW.raw_user_meta_data->>'preferred_language', 'en-US'),
     'citizen' -- ENFORCED: Public signup ALWAYS produces 'citizen' role!
@@ -347,6 +347,14 @@ CREATE POLICY "Users can read own profile or privileged roles read all"
   TO authenticated
   USING (auth.uid() = id OR public.get_auth_role() IN ('authority', 'responder', 'admin'));
 
+CREATE POLICY "Users can insert own citizen profile"
+  ON public.profiles FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    auth.uid() = id AND
+    role = 'citizen'
+  );
+
 CREATE POLICY "Users can update non-role profile fields"
   ON public.profiles FOR UPDATE
   TO authenticated
@@ -355,6 +363,12 @@ CREATE POLICY "Users can update non-role profile fields"
     auth.uid() = id AND 
     role = public.get_auth_role() -- Safe SECURITY DEFINER lookup prevents RLS recursion
   );
+
+CREATE POLICY "Authorities and Admins update profiles"
+  ON public.profiles FOR UPDATE
+  TO authenticated
+  USING (public.get_auth_role() IN ('authority', 'admin'))
+  WITH CHECK (public.get_auth_role() IN ('authority', 'admin'));
 
 -- --------------------------------------------------------------------
 -- EMERGENCY REPORTS POLICIES

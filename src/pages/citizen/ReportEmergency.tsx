@@ -50,10 +50,6 @@ export const ReportEmergency: React.FC = () => {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
-  useEffect(() => {
-    handleFetchGPS();
-  }, []);
-
   const handleFetchGPS = async () => {
     setIsLocating(true);
     setLocationError(null);
@@ -71,6 +67,10 @@ export const ReportEmergency: React.FC = () => {
       setIsLocating(false);
     }
   };
+
+  useEffect(() => {
+    handleFetchGPS();
+  }, []);
 
   const handleMapPinSelect = (newLoc: LocationCoordinates) => {
     setLocation(newLoc);

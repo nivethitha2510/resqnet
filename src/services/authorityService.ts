@@ -6,7 +6,7 @@
 
 import { supabase as defaultSupabase } from '../lib/supabase';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { PriorityLevel } from '../types/domain';
+import type { PriorityLevel, UserRole } from '../types/domain';
 
 export type VerificationDecision = 'approved' | 'modified' | 'rejected';
 
@@ -303,6 +303,63 @@ class AuthorityService {
     }
 
     return data || [];
+  }
+
+  /**
+   * Authority or Admin assigns a role to a user account
+   */
+  public async assignUserRole(
+    targetUserId: string,
+    newRole: UserRole,
+    customClient?: SupabaseClient
+  ): Promise<{ profile: any; auditLog?: any }> {
+    const client = customClient || defaultSupabase;
+    const { userId, role } = await this.getAuthenticatedAuthority(client);
+
+    const now = new Date().toISOString();
+
+    // 1. Update public.profiles
+    const { data: updatedProfile, error: updateErr } = await client
+      .from('profiles')
+      .update({
+        role: newRole,
+        updated_at: now,
+      })
+      .eq('id', targetUserId)
+      .select()
+      .single();
+
+    if (updateErr) {
+      console.error(`Role assignment failed for user ${targetUserId}:`, updateErr);
+      throw new Error(`Failed to assign role in PostgreSQL: ${updateErr.message}`);
+    }
+
+    // 2. Insert audit log
+    let auditLog = null;
+    try {
+      const { data: auditData } = await client
+        .from('audit_logs')
+        .insert({
+          user_id: userId,
+          user_role: role,
+          action: 'USER_ROLE_ASSIGNMENT',
+          target_entity: 'profiles',
+          target_id: targetUserId,
+          details: {
+            assigned_role: newRole,
+            target_user_id: targetUserId,
+            target_email: updatedProfile?.email,
+            timestamp: now,
+          },
+        })
+        .select()
+        .single();
+      auditLog = auditData;
+    } catch (auditErr) {
+      console.warn('Audit log write warning:', auditErr);
+    }
+
+    return { profile: updatedProfile, auditLog };
   }
 }
 

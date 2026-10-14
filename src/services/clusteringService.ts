@@ -244,11 +244,12 @@ class ClusteringService {
   private async createIncidentFromGroup(group: RawReportRow[]): Promise<IncidentRow | null> {
     const primary = group[0];
     const code = `INC-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-    const categoryLabel = primary.emergency_type.replace('_', ' ').toUpperCase();
-    const title = `${categoryLabel} Incident - ${primary.location_text.split(',')[0]}`;
+    const categoryLabel = (primary.emergency_type || 'emergency').replace('_', ' ').toUpperCase();
+    const primaryLoc = primary.location_text || 'Active Operational Zone';
+    const title = `${categoryLabel} Incident - ${primaryLoc.split(',')[0].trim()}`;
     
     const descriptions = group.map((r) => r.ai_summary || r.description).filter(Boolean);
-    const combinedDescription = descriptions.join(' | ');
+    const combinedDescription = descriptions.join(' | ') || `${categoryLabel} incident at ${primaryLoc}`;
 
     // Aggregate counts across group
     const affected = group.reduce((sum, r) => sum + (r.people_affected || 0), 0);
@@ -256,11 +257,10 @@ class ClusteringService {
     const trapped = group.reduce((sum, r) => sum + (r.people_trapped || 0), 0);
     const vulnerable = group.reduce((sum, r) => sum + (r.vulnerable_people || 0), 0);
 
-    // Calculate centroid coordinates
-    const latSum = group.reduce((sum, r) => sum + r.latitude, 0);
-    const lonSum = group.reduce((sum, r) => sum + r.longitude, 0);
-    const avgLat = latSum / group.length;
-    const avgLon = lonSum / group.length;
+    // Calculate centroid coordinates safely
+    const validCoords = group.filter((r) => r.latitude && r.longitude && !isNaN(Number(r.latitude)) && !isNaN(Number(r.longitude)));
+    const avgLat = validCoords.length > 0 ? validCoords.reduce((sum, r) => sum + Number(r.latitude), 0) / validCoords.length : 13.0827;
+    const avgLon = validCoords.length > 0 ? validCoords.reduce((sum, r) => sum + Number(r.longitude), 0) / validCoords.length : 80.2707;
 
     // Determine max priority/severity
     const priorityOrder: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
@@ -276,7 +276,7 @@ class ClusteringService {
     }
 
     const clusterId = `CLUS-${Date.now()}`;
-    const reason = `Grouped ${group.length} emergency report(s) within 3.0km radius and time window sharing category '${primary.emergency_type}' and location '${primary.location_text}'.`;
+    const reason = `Grouped ${group.length} emergency report(s) within 3.0km radius and time window sharing category '${primary.emergency_type}' and location '${primaryLoc}'.`;
 
     const { data: newIncident, error: incErr } = await supabase
       .from('incidents')
@@ -284,13 +284,13 @@ class ClusteringService {
         code,
         title,
         description: combinedDescription,
-        emergency_type: primary.emergency_type,
+        emergency_type: primary.emergency_type || 'other',
         priority: maxPriority,
         severity: maxPriority,
         status: 'open',
         latitude: avgLat,
         longitude: avgLon,
-        location_text: primary.location_text,
+        location_text: primaryLoc,
         affected_count: affected,
         trapped_count: trapped,
         injured_count: injured,

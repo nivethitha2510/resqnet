@@ -4,7 +4,7 @@
  * Enforces RLS isolation for the authenticated user session.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../context/AuthContext';
@@ -27,11 +27,7 @@ export const MyReports: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchMyReports();
-  }, [user]);
-
-  const fetchMyReports = async () => {
+  const fetchMyReports = useCallback(async () => {
     setIsLoading(true);
     setError(null);
 
@@ -52,7 +48,12 @@ export const MyReports: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    fetchMyReports();
+  }, [fetchMyReports, user]);
+
 
   return (
     <div className="max-w-3xl mx-auto space-y-5">

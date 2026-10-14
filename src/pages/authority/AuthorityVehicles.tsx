@@ -5,7 +5,7 @@
  * Disallows arbitrary manual operational status overrides.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { supabase } from '../../lib/supabase';
 import { realtimeService } from '../../services/realtimeService';
 import { MapPin, Phone, Loader2, AlertCircle, Radio, Truck, Lock } from 'lucide-react';
@@ -19,7 +19,7 @@ export const AuthorityVehicles: React.FC = () => {
   const [realtimeStatus, setRealtimeStatus] = useState<'LIVE' | 'CONNECTING'>('CONNECTING');
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
-  const fetchVehicles = async () => {
+  const fetchVehicles = useCallback(async () => {
     try {
       const { data, error: fetchErr } = await supabase
         .from('vehicles')
@@ -34,7 +34,7 @@ export const AuthorityVehicles: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchVehicles();
@@ -43,18 +43,24 @@ export const AuthorityVehicles: React.FC = () => {
       'authority-vehicles-channel',
       ['vehicles'],
       () => {
-        setRealtimeStatus('LIVE');
         fetchVehicles();
+      },
+      undefined,
+      (status) => {
+        if (status === 'SUBSCRIBED') {
+          setRealtimeStatus('LIVE');
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          setRealtimeStatus('CONNECTING');
+        }
       }
     );
-    setRealtimeStatus('LIVE');
 
     return () => {
       unsubscribe();
     };
-  }, []);
+  }, [fetchVehicles]);
 
-  const handleToggleMaintenance = async (vehicleId: string, currentStatus: VehicleStatus) => {
+  const handleToggleMaintenance = useCallback(async (vehicleId: string, currentStatus: VehicleStatus) => {
     if (['assigned', 'en_route', 'on_scene'].includes(currentStatus)) {
       setError('Active operational vehicles assigned to emergency incidents cannot be placed in maintenance directly.');
       return;
@@ -91,7 +97,7 @@ export const AuthorityVehicles: React.FC = () => {
     } finally {
       setUpdatingId(null);
     }
-  };
+  }, [fetchVehicles]);
 
   if (isLoading) {
     return (
